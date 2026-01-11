@@ -1,0 +1,279 @@
+import cv2
+import queue
+import numpy as np
+from feature_extractor import FeatureExtractor
+import os
+import time
+from inference_sdk import InferenceHTTPClient
+import threading
+from collections import deque
+import uuid
+import json
+from pathlib import Path
+from datetime import datetime
+
+# === Data Structures for Roboflow API Adpater ===
+class DummyBoxes:
+    """A dummy class to mimic the structure of Ultralytics's Boxes object."""
+    def __init__(self, xyxy, cls, conf):
+        self.xyxy = np.array(xyxy)
+        self.cls = np.array(cls)
+        self.conf = np.array(conf)
+
+    def __len__(self):
+        return len(self.xyxy)
+
+class DummyResults:
+    """A dummy class to mimic the structure of Ultralytics's Results object."""
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+# --- Worker Configuration ---
+CLASS_NAMES = ["Lemper", "Pastel", "Kue Lapis", "Kue Mangkok", "Wajik"]
+BOX_COLORS = {
+    "Lemper": "#00FF00", "Pastel": "#D2B48C", "Kue Lapis": "#FFFFFF",
+    "Kue Mangkok": "#FFC0CB", "Wajik": "#654321"
+}
+
+FILTERING_THRESHOLDS = {
+    1: { # Camera 1
+        "min_area_ratio": 0.001, "max_area_ratio": 0.5,
+        "min_aspect_ratio": 0.2, "max_aspect_ratio": 5.0,
+    },
+    2: { # Camera 2
+        "min_area_ratio": 0.001, "max_area_ratio": 0.5,
+        "min_aspect_ratio": 0.2, "max_aspect_ratio": 5.0,
+    },
+    3: { # Camera 3
+        "min_area_ratio": 0.001, "max_area_ratio": 0.5,
+        "min_aspect_ratio": 0.2, "max_aspect_ratio": 5.0,
+    }
+}
+
+MODEL_ID = "scan-ai-fjknd/1"
+
+def hex_to_bgr(hex_color):
+    """Converts hex color to a BGR tuple."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (4, 2, 0))
+
+def is_likely_background(box, frame_shape, camera_id):
+    """Filters detections based on bounding box properties."""
+    frame_h, frame_w = frame_shape
+    thresh = FILTERING_THRESHOLDS.get(camera_id, FILTERING_THRESHOLDS[1])
+
+    x1, y1, x2, y2 = box
+    box_w, box_h = x2 - x1, y2 - y1
+    if box_w <= 0 or box_h <= 0: return True
+
+    frame_area = frame_w * frame_h
+    box_area = box_w * box_h
+    area_ratio = box_area / frame_area
+    if not (thresh["min_area_ratio"] < area_ratio < thresh["max_area_ratio"]):
+        return True
+
+    aspect_ratio = box_w / box_h
+    if not (thresh["min_aspect_ratio"] < aspect_ratio < thresh["max_aspect_ratio"]):
+        return True
+
+    return False
+
+def draw_detections(frame, results, scale_x, scale_y):
+    """Draws detections on the frame."""
+    if not (results and results.boxes):
+        return
+
+    for i, box_coords in enumerate(results.boxes.xyxy):
+        x1, y1, x2, y2 = [int(c) for c in box_coords]
+        cls_id = int(results.boxes.cls[i])
+        class_name = CLASS_NAMES[cls_id] if 0 <= cls_id < len(CLASS_NAMES) else "Unknown"
+        color = hex_to_bgr(BOX_COLORS.get(class_name, "#FF0000"))
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = f"{class_name} {results.boxes.conf[i]:.2f}"
+        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(frame, (x1, y1 - h - 5), (x1 + w, y1), color, -1)
+        cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+def robo_inference_thread(camera_id, frames_q, results_q, stop_event, img_size):
+    """Dedicated thread for running Roboflow inference."""
+    # Each thread gets its own client instance for robustness.
+    client = InferenceHTTPClient(
+        api_url="https://detect.roboflow.com",
+        api_key="3Rm17tBWTKe8KKiJg2Vy" # Replace with your actual Roboflow API key
+    )
+    print(f"[InferThread-{camera_id}] Starting...")
+    while not stop_event.is_set():
+        try:
+            frame_id, frame_to_process = frames_q.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        yolo_results = None
+        try:
+            # Infer directly from the NumPy array in memory, removing file I/O bottleneck.
+            response = client.infer(frame_to_process, model_id=MODEL_ID)
+            boxes_xyxy, confs, clss = [], [], []
+            for pred in response.get('predictions', []):
+                x1, y1 = pred['x'] - pred['width'] / 2, pred['y'] - pred['height'] / 2
+                x2, y2 = pred['x'] + pred['width'] / 2, pred['y'] + pred['height'] / 2
+                boxes_xyxy.append([x1, y1, x2, y2])
+                confs.append(pred['confidence'])
+                clss.append(CLASS_NAMES.index(pred['class']) if pred['class'] in CLASS_NAMES else -1)
+            if boxes_xyxy:
+                yolo_results = DummyResults(DummyBoxes(boxes_xyxy, clss, confs))
+        except Exception as e:
+            print(f"[InferThread-{camera_id}] Roboflow inference failed: {e}")
+        finally:
+            results_q.put((frame_id, yolo_results))
+    print(f"[InferThread-{camera_id}] Stopped.")
+
+def inference_worker(camera_id, video_source, display_queue, control_queue, img_size):
+    """Main worker process for video capture, processing, and display."""
+    print(f"[Worker-{camera_id}] Initializing...")
+    feature_extractor = FeatureExtractor()
+    stop_event = threading.Event()
+    frames_q = queue.Queue(maxsize=2)
+    results_q = queue.Queue()
+
+    thread = threading.Thread(target=robo_inference_thread, args=(camera_id, frames_q, results_q, stop_event, img_size))
+    thread.start()
+
+    cap = cv2.VideoCapture(video_source)
+    if not cap.isOpened():
+        print(f"[Worker-{camera_id}] Error: Cannot open video source {video_source}")
+        stop_event.set()
+        thread.join()
+        return
+
+    frame_id, last_processed_id = 0, -1
+    video_writer, is_recording = None, False
+    frame_buffer, results_buffer = {}, {}
+
+    while not stop_event.is_set():
+        try:
+            cmd = control_queue.get_nowait()
+            if cmd == 'STOP':
+                break
+            elif cmd == 'TOGGLE_RECORD':
+                is_recording = not is_recording
+                if is_recording:
+                    # Start a new recording
+                    output_dir = Path("output_videos")
+                    output_dir.mkdir(exist_ok=True)
+                    today_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                    video_filename = output_dir / f"recorded_camera_{camera_id}_{today_str}.mp4"
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    video_writer = cv2.VideoWriter(str(video_filename), fourcc, fps, (frame_width, frame_height))
+                    print(f"[Worker-{camera_id}] Started recording to {video_filename}")
+                else:
+                    # Stop and save the current recording
+                    if video_writer:
+                        video_writer.release()
+                        video_writer = None
+                        print(f"[Worker-{camera_id}] Stopped recording.")
+        except queue.Empty:
+            pass
+
+        ret, frame = cap.read()
+        if not ret:
+            print(f"[Worker-{camera_id}] End of video. Restarting capture.")
+            cap.release()
+            cap = cv2.VideoCapture(video_source)
+            continue
+
+        # Write the original frame to the video file if recording is active
+        if is_recording and video_writer:
+            video_writer.write(frame)
+
+        frame_id += 1
+        frame_buffer[frame_id] = frame
+        if not frames_q.full():
+            frames_q.put((frame_id, cv2.resize(frame, (img_size, img_size))))
+
+        try:
+            res_id, yolo_results = results_q.get_nowait()
+            results_buffer[res_id] = yolo_results
+        except queue.Empty:
+            pass
+
+        processed_id = -1
+        for f_id in sorted(frame_buffer.keys()):
+            if f_id in results_buffer:
+                processed_id = f_id
+                break
+        
+        if processed_id > last_processed_id:
+            last_processed_id = processed_id
+            frame_to_process = frame_buffer.pop(processed_id)
+            yolo_results = results_buffer.pop(processed_id)
+            orig_h, orig_w = frame_to_process.shape[:2]
+            scale_x, scale_y = orig_w / img_size, orig_h / img_size
+
+            filtered_results = None
+            if yolo_results and yolo_results.boxes:
+                f_boxes, f_clss, f_confs = [], [], []
+                for i, b in enumerate(yolo_results.boxes.xyxy):
+                    scaled_box = (b[0] * scale_x, b[1] * scale_y, b[2] * scale_x, b[3] * scale_y)
+                    if not is_likely_background(scaled_box, (orig_h, orig_w), camera_id):
+                        f_boxes.append(scaled_box)
+                        f_clss.append(yolo_results.boxes.cls[i])
+                        f_confs.append(yolo_results.boxes.conf[i])
+                if f_boxes:
+                    filtered_results = DummyResults(DummyBoxes(f_boxes, f_clss, f_confs))
+
+            frame_with_detections = frame_to_process.copy()
+            simple_results, raw_validation_data = [], []
+            if filtered_results:
+                draw_detections(frame_with_detections, filtered_results, 1, 1) # Already scaled
+
+                # Step 1: Collect all valid crops from detections
+                crops = []
+                valid_detections_indices = []
+                for i, b in enumerate(filtered_results.boxes.xyxy):
+                    x1, y1, x2, y2 = [int(c) for c in b]
+                    if y1 < y2 and x1 < x2: # Ensure the crop is valid
+                        crops.append(frame_to_process[y1:y2, x1:x2])
+                        valid_detections_indices.append(i)
+
+                # Step 2: Extract features for all crops in a single batch
+                feature_vectors = []
+                if crops:
+                    feature_vectors = feature_extractor.extract_features_batch(crops)
+
+                # Step 3: Associate features with their detections
+                for i, feature in enumerate(feature_vectors):
+                    detection_idx = valid_detections_indices[i]
+                    box = filtered_results.boxes.xyxy[detection_idx]
+                    x1, y1, x2, y2 = [int(c) for c in box]
+                    class_name = CLASS_NAMES[int(filtered_results.boxes.cls[detection_idx])]
+                    confidence = filtered_results.boxes.conf[detection_idx]
+                    cls_idx = int(filtered_results.boxes.cls[detection_idx])
+
+                    simple_results.append({
+                        'bbox': (x1, y1, x2, y2),
+                        'conf': confidence,
+                        'cls_idx': cls_idx,
+                        'class_name': class_name,
+                        'feature_vector': feature
+                    })
+                    raw_validation_data.append({'box_xyxy': (x1, y1, x2, y2), 'class_name': class_name, 'feature': feature})
+
+            if display_queue.qsize() < 100:
+                display_queue.put((camera_id, frame_with_detections, simple_results, raw_validation_data))
+
+        # Cleanup buffers
+        for key_to_del in [k for k in frame_buffer if k < last_processed_id - 10]:
+            del frame_buffer[key_to_del]
+            results_buffer.pop(key_to_del, None)
+
+    print(f"[Worker-{camera_id}] Stopping...")
+    stop_event.set()
+    thread.join()
+    cap.release()
+    if video_writer:
+        video_writer.release()
+    print(f"[Worker-{camera_id}] Stopped.")

@@ -1,0 +1,22 @@
+description: Ultralytics YOLO11n-seg model trained on /home/pi/Downloads/cv_tambak/kue_dataset.yaml
+author: Ultralytics
+date: '2025-06-19T09:37:52.519259'
+version: 8.3.155
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: segment
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: lemper
+  1: pastel
+  2: kue lapis
+  3: kue mangkok
+  4: wajik
+args:
+  batch: 1
+  name: rk3588
+channels: 3

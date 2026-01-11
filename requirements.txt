@@ -1,0 +1,14 @@
+# Essential requirements - actually used in the code
+numpy>=1.21.0
+opencv-python>=4.5.0
+pillow>=8.0.0
+torch>=2.0.0
+ultralytics>=8.3.0
+rknn-toolkit2>=1.4.0  # Required for RKNN model inference on NanoPC T6
+
+# Note: The following are part of Python standard library:
+# - pathlib
+# - datetime
+# - sys
+# - os
+# - tkinter (usually bundled with Python installation)
